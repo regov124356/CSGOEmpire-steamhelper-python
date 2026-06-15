@@ -1,4 +1,6 @@
-from datetime import datetime
+from logger import logger
+
+import asyncio
 
 import requests
 
@@ -20,9 +22,11 @@ class Telegram:
             'text': message
         }
         try:
-            response = requests.post(self.url, data=payload)
+            response = await asyncio.to_thread(requests.post, self.url, data=payload)
 
             if response.status_code == 200:
-                print(f"[{datetime.now()}] - Message sent")
+                logger.info("Message sent")
+            else:
+                logger.error(f"Telegram returned {response.status_code}: {response.text}")
         except requests.exceptions.RequestException as err:
-            print(f"[{datetime.now()}] - Error in send_message: {err}")
+            logger.exception(f"Error in send_message: {err}")

@@ -1,5 +1,4 @@
-items.py
-test.py
+TODO.md
 
 # Created by https://www.toptal.com/developers/gitignore/api/python
 # Edit at https://www.toptal.com/developers/gitignore?templates=python
@@ -136,6 +135,8 @@ env.bak/
 venv.bak/
 
 /secrets
+config.json
+steam_inventory_exports/
 
 # Spyder project settings
 .spyderproject

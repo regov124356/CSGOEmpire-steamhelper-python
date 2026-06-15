@@ -1,81 +1,176 @@
-import math
-from collections import defaultdict
+"""
+Thin async client for the CSFloat API.
 
-from csfloat_api.csfloat_client import Client, Me
+Inherits the raw endpoints from csfloat_api.Client and overrides _request to add
+the cross-cutting concerns every call needs:
+
+    - a single pooled aiohttp session (the base library opens a new session per
+      request, which kills connection reuse)
+    - adaptive per-endpoint rate limiting driven by the x-ratelimit-* response
+      headers (CSFloat limits each endpoint separately, e.g. /listings = 200/h
+      while /listings/{id}/buy-orders = 20/min)
+    - retries on transient failures (429, 5xx, network), honouring the reset time
+    - typed CSFloatError instead of bare Exception
+
+No pricing logic lives here. Computing prices, the divider conversion and the
+refresh loop belong to price_service.PriceService.
+"""
+
+import asyncio
+import re
+import time
+from typing import Optional
+
+import aiohttp
+from csfloat_api.csfloat_client import Client
+
+API_URL = 'https://csfloat.com/api/v1'
+
+_ID_SEGMENT = re.compile(r"^\d+$")
+
+
+class CSFloatError(Exception):
+    """Raised when a CSFloat request fails after exhausting retries."""
+
+    def __init__(self, message: str, status: Optional[int] = None, payload=None):
+        super().__init__(message)
+        self.status = status
+        self.payload = payload
+
+
+class _Bucket:
+    """Live rate-limit state for one endpoint, learned from response headers."""
+    __slots__ = ("limit", "remaining", "reset", "lock")
+
+    def __init__(self):
+        self.limit: Optional[int] = None
+        self.remaining: Optional[int] = None
+        self.reset: Optional[float] = None  # epoch seconds
+        self.lock = asyncio.Lock()
 
 
 class CSFloatClient(Client):
-    def __init__(self, api_key: str):
+    # base Client uses __slots__; this subclass gets a __dict__, so the extra
+    # instance attributes below are fine.
+    def __init__(self, api_key: str, *, max_retries: int = 3, timeout: float = 30.0,
+                 verify_ssl: bool = False):
         super().__init__(api_key)
-        self.divider: float = None
-        self._inventory = []
+        self.max_retries = max_retries
+        self._timeout = aiohttp.ClientTimeout(total=timeout)
+        self._verify_ssl = verify_ssl
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._buckets: dict[str, _Bucket] = {}
 
+    # ------------------------------------------------------------------ #
+    # session lifecycle
+    # ------------------------------------------------------------------ #
+    async def __aenter__(self) -> "CSFloatClient":
+        self._ensure_session()
+        return self
 
-    def get_divider(self):
-        return self.divider
+    async def __aexit__(self, *exc) -> None:
+        await self.close()
 
-    def set_divider(self, divider: float):
-        self.divider = divider
+    def _ensure_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(headers=self._headers, timeout=self._timeout)
+        return self._session
 
-    async def get_steamid64(self):
-        me = await self.get_me()
-        return me.user.steam_id
+    async def close(self) -> None:
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+            self._session = None
 
-    async def check_price(self, market_hash_name: str) -> tuple[int, int]:
-        if "&" in market_hash_name:
-            market_hash_name = market_hash_name.replace("&", "%26")
+    # ------------------------------------------------------------------ #
+    # rate-limit bucket handling
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _bucket_key(method: str, parameters: str) -> str:
+        """Normalise a path into a per-endpoint bucket key (ids -> {id})."""
+        path = parameters.split("?", 1)[0]
+        segments = ["{id}" if _ID_SEGMENT.match(s) else s for s in path.split("/")]
+        return f"{method} {'/'.join(segments)}"
 
-        listings = await self.get_all_listings(sort_by="lowest_price", type_="buy_now",
-                                               market_hash_name=market_hash_name)
+    @staticmethod
+    def _read_headers(headers):
+        try:
+            return (int(headers["x-ratelimit-limit"]),
+                    int(headers["x-ratelimit-remaining"]),
+                    float(headers["x-ratelimit-reset"]))
+        except (KeyError, ValueError):
+            return None
 
-        if not listings:
-            return 0, 0
+    def _update_bucket(self, bucket: _Bucket, headers) -> None:
+        parsed = self._read_headers(headers)
+        if parsed:
+            bucket.limit, bucket.remaining, bucket.reset = parsed
 
-        first_item = listings[0]
-        listing_id = first_item.id
-        price = first_item.price
+    @staticmethod
+    async def _pace(bucket: _Bucket) -> None:
+        """Spread the remaining quota evenly across the window to avoid 429s."""
+        if bucket.reset is None or bucket.remaining is None:
+            return
+        now = time.time()
+        if bucket.reset <= now:
+            return
+        if bucket.remaining <= 0:
+            await asyncio.sleep(bucket.reset - now)
+        else:
+            await asyncio.sleep((bucket.reset - now) / bucket.remaining)
 
-        buy_orders = await self.get_buy_orders(listing_id=listing_id)
+    # ------------------------------------------------------------------ #
+    # core request (overrides csfloat_api.Client._request)
+    # ------------------------------------------------------------------ #
+    async def _request(self, method: str, parameters: str, json_data=None) -> Optional[dict]:
+        if method not in self._SUPPORTED_METHODS:
+            raise ValueError('Unsupported HTTP method.')
 
-        if not buy_orders:
-            return 0, 0
+        url = f"{API_URL}{parameters}"
+        bucket = self._buckets.setdefault(self._bucket_key(method, parameters), _Bucket())
+        session = self._ensure_session()
+        attempt = 0
 
-        buy_orders_list = []
-        for bo in buy_orders:
-            if not bo.expression:
-                buy_orders_list.append(bo)
+        async with bucket.lock:
+            while True:
+                await self._pace(bucket)
+                try:
+                    async with session.request(method, url, ssl=self._verify_ssl,
+                                               json=json_data) as resp:
+                        self._update_bucket(bucket, resp.headers)
 
-        if not buy_orders_list:
-            return 0, 0
+                        if resp.status == 429:
+                            if attempt >= self.max_retries:
+                                raise CSFloatError("Rate limited, retries exhausted", 429)
+                            attempt += 1
+                            continue  # _pace waits until reset (remaining <= 0)
 
-        first_buy_order = buy_orders_list[0]
-        buy_order_price = first_buy_order.price
+                        if resp.status >= 500:
+                            if attempt >= self.max_retries:
+                                raise CSFloatError(f"Server error {resp.status}",
+                                                   resp.status, await self._safe_body(resp))
+                            attempt += 1
+                            await asyncio.sleep(2 ** attempt)
+                            continue
 
-        float_price = math.floor(buy_order_price if price < 100 else (price + buy_order_price) / 2)
+                        if resp.status != 200:
+                            message = self.ERROR_MESSAGES.get(resp.status, f"HTTP {resp.status}")
+                            raise CSFloatError(message, resp.status, await self._safe_body(resp))
 
-        after_fee = math.floor(float_price * 0.98)
-        empire_price = math.floor(after_fee / self.divider)
-        #print(f'{market_hash_name}: {empire_price / 100}')
+                        if resp.content_type != 'application/json':
+                            raise CSFloatError(f"Expected JSON, got {resp.content_type}",
+                                               resp.status)
 
-        return empire_price, float_price
+                        return await resp.json()
 
-    async def get_filtered_pending_trades(self) -> dict[str, list[str]]:
-        results = await self.get_pending_trades()
-        trades = results['trades']
+                except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+                    if attempt >= self.max_retries:
+                        raise CSFloatError(f"Network error: {err}") from err
+                    attempt += 1
+                    await asyncio.sleep(2 ** attempt)
 
-        pending_items = defaultdict(list)
-
-        for trade in trades:
-            item = trade['contract']['item']
-            if item['is_commodity']:
-                pending_items[item['item_name']].append(item['asset_id'])
-
-        return pending_items
-
-    async def get_my_stall(self, limit: int = 1000):
-        steamid64 = await self.get_steamid64()
-        parameters = f"/users/{steamid64}/stall?limit={limit}"
-        method = "GET"
-
-        response = await self._request(key="get_me", method=method, parameters=parameters)
-        return response
+    @staticmethod
+    async def _safe_body(resp):
+        try:
+            return await resp.json()
+        except Exception:
+            return await resp.text()
