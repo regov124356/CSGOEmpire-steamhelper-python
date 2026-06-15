@@ -54,7 +54,14 @@ class CSFloatClient(Client):
     # instance attributes below are fine.
     def __init__(self, api_key: str, *, max_retries: int = 3, timeout: float = 30.0,
                  verify_ssl: bool = False):
-        super().__init__(api_key)
+        # Deliberately skip super().__init__: base Client (csfloat_api >=1.1.0)
+        # eagerly opens a ClientSession + connector in its constructor, which we'd
+        # immediately orphan (setting _session = None below) -> "Unclosed client
+        # session" warning. We manage our own pooled session via _ensure_session,
+        # so set up just the slots the base/our code reads instead.
+        self.API_KEY = api_key
+        self.proxy = None
+        self._headers = {"Authorization": api_key}
         self.max_retries = max_retries
         self._timeout = aiohttp.ClientTimeout(total=timeout)
         self._verify_ssl = verify_ssl

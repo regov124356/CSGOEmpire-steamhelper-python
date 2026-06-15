@@ -45,8 +45,11 @@ class PriceService:
             raise ValueError("divider not set")
 
         name = quote(market_hash_name, safe="")
-        listings = await self.client.get_all_listings(
+        # get_all_listings returns {"listings": [...], "cursor": ...} (csfloat_api
+        # >=1.1.0), not a bare list as in 1.0.2.
+        result = await self.client.get_all_listings(
             sort_by="lowest_price", type_="buy_now", market_hash_name=name)
+        listings = result["listings"]
         if not listings:
             return None
 
