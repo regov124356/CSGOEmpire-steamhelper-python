@@ -5,42 +5,70 @@ from datetime import datetime
 
 try:
     import colorama
-    colorama.init()
+    # just_fix_windows_console enables the console's native VT processing without
+    # wrapping stdout. colorama.init()'s convert mode only understands 16-color
+    # codes and STRIPS 24-bit truecolor (38;2;r;g;b) — which is all we emit.
+    if hasattr(colorama, "just_fix_windows_console"):
+        colorama.just_fix_windows_console()
+    else:
+        colorama.init(convert=False, strip=False)  # don't mangle truecolor
 except ImportError:
     pass
 
-RESET   = '\033[0m'
-BOLD    = '\033[1m'
-DIM     = '\033[2m'
-RED     = '\033[91m'
-GREEN   = '\033[92m'
-YELLOW  = '\033[93m'
-BLUE    = '\033[94m'
-MAGENTA = '\033[95m'
-CYAN    = '\033[96m'
-WHITE   = '\033[97m'
+RESET = '\033[0m'
+BOLD  = '\033[1m'
 
-# tag -> color (applied to the whole line when level is INFO/DEBUG)
+
+def _fg(hex_code: str) -> str:
+    """Hex (#rrggbb) -> 24-bit truecolor ANSI foreground escape."""
+    h = hex_code.lstrip('#')
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f'\033[38;2;{r};{g};{b}m'
+
+
+# ---- palette: edit these hex values to taste -------------------------------
+# Pick any hex (e.g. from coolors.co). Truecolor needs a modern terminal
+# (Windows Terminal ok). Greys go light -> dark: GREY > GREY_DARK.
+RED     = _fg("#f56666")
+GREEN   = _fg("#2c852c")
+GREEN_DARK = _fg("#185818")
+YELLOW  = _fg('#d7af5f')
+BLUE    = _fg("#4969aa")
+MAGENTA = _fg('#af5fd7')
+CYAN    = _fg("#28a1a1")
+CYAN_DARK = _fg("#176868")
+WHITE   = _fg('#e4e4e4')   # default INFO line
+GREY      = _fg("#B9B9B9")  # light grey — low-signal housekeeping
+GREY_DARK = _fg("#2B2B2B")  # dark grey  — connection noise / DEBUG
+# ----------------------------------------------------------------------------
+
+# tag -> color (applied to the whole line when level is INFO/DEBUG).
+# A few hues carry the signal; everything else is greyscale plumbing so the eye
+# lands on what matters.
+#   GREEN   — value landed   (item received / offer accepted)
+#   CYAN    — live auction    (bid / new auction / outbid)
+#   YELLOW  — needs attention (dispute / decline)
+# Greyscale (GREY > GREY_DARK): trade/db records + connection housekeeping.
 _TAG_COLORS: dict[str, str] = {
-    "bid":      CYAN,
-    "outbid":   YELLOW,
-    "auction":  CYAN,
-    "filters":  BLUE,
-    "ws":       DIM + WHITE,
-    "trade":    MAGENTA,
+    "bid":      GREY,
+    "accept":   GREEN_DARK,
     "recv":     GREEN,
-    "accept":   GREEN,
-    "offers":   BLUE,
-    "decline":  YELLOW,
+    "auction":  CYAN,
+    "outbid":   GREY,
     "dispute":  YELLOW,
-    "token":    DIM + WHITE,
-    "skip":     DIM,
-    "db":       MAGENTA,
-    "telegram": BLUE,
+    "decline":  YELLOW,
+    "trade":    GREY,
+    "db":       GREY,
+    "offers":   GREY,
+    "filters":  BLUE,
+    "telegram": GREY,
+    "ws":       GREY_DARK,
+    "token":    BLUE,
+    "skip":     GREY_DARK,
 }
 
 _LEVEL_COLORS: dict[int, str] = {
-    logging.DEBUG:    DIM,
+    logging.DEBUG:    GREY_DARK,
     logging.INFO:     WHITE,
     logging.WARNING:  YELLOW,
     logging.ERROR:    RED,

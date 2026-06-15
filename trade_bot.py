@@ -75,6 +75,8 @@ class TradeBot:
                         result = await self.empire.update_access_token(token)
                         if not result.get('success'):
                             logger.error(f"[token] update failed: {result}")
+                        else:
+                            logger.info("[token] Steam access token refreshed on Empire")
                         await asyncio.sleep(60)
                         continue
 
@@ -164,10 +166,13 @@ class TradeBot:
                             accepted = await asyncio.to_thread(
                                 self.steam.accept_trade_offer, so_tradeoffer_id)
                         except Exception as err:
-                            logger.error(f"[accept] failed: {err}")
+                            logger.error(f"[accept] steam offer {so_tradeoffer_id} "
+                                         f"({oe_market_name} from {oe_steam_name}) failed: {err}")
                             break
 
                         if accepted:
+                            logger.info(f"[accept] steam offer {so_tradeoffer_id} from "
+                                        f"{oe_steam_name} ({so_steamid64}) — {oe_market_name} accepted")
                             tasks.append(asyncio.create_task(self._mark_received_safe(
                                 oe_item_id, so_tradeoffer_id, oe_tradeoffer_id, so_market_hash_name, oe_steam_name, so_steamid64)))
                             await self._record_purchase(
@@ -232,12 +237,15 @@ class TradeBot:
         # tradeoffer_id as the docs label the path) — matches the working setup.
         try:
             await self.empire.mark_as_received(item_id)
-            logger.info(f"[accept] {market_name} from {steam_name}, id64 {steamid64} (steam offer {tradeoffer_id}, empire offer {empire_offer_id}) marked as received")
+            logger.info(f"[recv] {market_name} (empire item {item_id}, empire offer "
+                        f"{empire_offer_id}) marked as received")
         except CSGOEmpireError as err:
             if err.status == 404:
-                logger.warning(f"[recv] steam offer {tradeoffer_id} not found (mark-as-received)")
+                logger.warning(f"[recv] {market_name} (steam offer {tradeoffer_id}) "
+                               f"not found on Empire (mark-as-received)")
             else:
-                logger.error(f"[recv] mark-as-received failed: {err}")
+                logger.error(f"[recv] {market_name} (empire item {item_id}) "
+                             f"mark-as-received failed: {err}")
 
     async def dispute_and_notify(self, item_id, market_name: str, created_at: str,
                                  total_value: int, steam_name: str, steam_id64: str,
@@ -245,7 +253,8 @@ class TradeBot:
         try:
             await self.empire.dispute_trade(item_id)
         except CSGOEmpireError as err:
-            logger.error(f"[dispute] failed on CSGOEmpire: {err}")
+            logger.error(f"[dispute] {market_name} (empire item {item_id}) "
+                         f"failed on CSGOEmpire: {err}")
             return
 
         bought = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S") + timedelta(hours=1)

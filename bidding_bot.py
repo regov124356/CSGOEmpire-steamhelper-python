@@ -235,6 +235,8 @@ class BiddingBot:
                 logger.info(f"[recv] {market_name} {data.get('total_value', 0) / 100:.2f} C "
                             f"from {partner.get('steam_name')} "
                             f"(tradeId {data.get('id')}, steamId {partner.get('steam_id')})")
+            if status == 13:
+                logger.info(f"[recv] {market_name} (id {data.get('id')})")
             if status in (4, 8, 9, 10, 11):
                 needs_refresh = True
 
@@ -252,22 +254,22 @@ class BiddingBot:
             while True:
                 try:
                     await self.empire.place_bid(item_id, bid_value, fail_fast_429=True)
-                    logger.info(f"[bid] placed {bid_value / 100:.2f} C")
+                    logger.info(f"[bid] {item_id} placed {bid_value / 100:.2f} C")
                     return BidResult.SUCCESS
                 except CSGOEmpireError as err:
                     payload = err.payload if isinstance(err.payload, dict) else {}
                     message = payload.get("message", "")
 
                     if err.status and err.status >= 500:
-                        logger.error("[bid] failed — server error")
+                        logger.error(f"[bid] {item_id} failed — server error")
                         return BidResult.FAILED
 
-                    logger.error(f"[bid] rejected — {message or err}")
+                    logger.error(f"[bid] {item_id} rejected — {message or err}")
 
                     if message == ERR_ONE_TRADE:
                         one_trade_retries += 1
                         if one_trade_retries > MAX_ONE_TRADE_RETRIES:
-                            logger.error("[bid] gave up — 'one trade at a time' persisted")
+                            logger.error(f"[bid] {item_id} gave up — 'one trade at a time' persisted")
                             return BidResult.FAILED
                         await asyncio.sleep(1)
                         continue
@@ -276,7 +278,7 @@ class BiddingBot:
                         next_bid = payload.get("data", {}).get("next_bid")
                         if next_bid is not None and int(next_bid) <= bid_max:
                             bid_value = int(next_bid)
-                            logger.info(f"[bid] re-bidding at {bid_value / 100:.2f} C")
+                            logger.info(f"[bid] {item_id} re-bidding at {bid_value / 100:.2f} C")
                             continue
                         return BidResult.FAILED
 
