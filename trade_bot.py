@@ -14,7 +14,8 @@ import random
 import time
 from datetime import datetime, timedelta, timezone
 
-from logger import logger
+from logger import logger as _logger
+logger = _logger.prefixed("trade")
 from db import DB
 from telegram import Telegram
 from steam_client import SteamClient

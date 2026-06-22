@@ -97,6 +97,27 @@ class ColoredFormatter(logging.Formatter):
         return f"{color}{line}{RESET}"
 
 
+class _SourceFilter(logging.Filter):
+    """Fills missing %(source)s on records that don't come from a prefixed logger."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "source"):
+            record.source = "-"  # type: ignore[attr-defined]
+        return True
+
+
+class _PrefixedLogger:
+    """Wraps a stdlib Logger via LoggerAdapter so %(source)s appears as its own column."""
+    def __init__(self, base_logger: logging.Logger, prefix: str) -> None:
+        self._adapter = logging.LoggerAdapter(base_logger, {"source": prefix})
+
+    def debug(self, msg: str) -> None:     self._adapter.debug(msg)
+    def info(self, msg: str) -> None:      self._adapter.info(msg)
+    def warning(self, msg: str) -> None:   self._adapter.warning(msg)
+    def error(self, msg: str) -> None:     self._adapter.error(msg)
+    def critical(self, msg: str) -> None:  self._adapter.critical(msg)
+    def exception(self, msg: str) -> None: self._adapter.exception(msg)
+
+
 class Logger:
     def __init__(self, log_dir="logs"):
         if not os.path.exists(log_dir):
@@ -109,16 +130,19 @@ class Logger:
         self.logger.setLevel(logging.DEBUG)
 
         if not self.logger.handlers:
-            plain_fmt = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-            color_fmt = ColoredFormatter('%(asctime)s - %(levelname)s - %(message)s')
+            src_filter = _SourceFilter()
+            plain_fmt = logging.Formatter('%(asctime)s - %(source)s - %(levelname)s - %(message)s')
+            color_fmt = ColoredFormatter('%(asctime)s - %(source)s - %(levelname)s - %(message)s')
 
             file_handler = logging.FileHandler(log_file, encoding='utf-8')
             file_handler.setLevel(logging.DEBUG)
             file_handler.setFormatter(plain_fmt)
+            file_handler.addFilter(src_filter)
 
             console_handler = logging.StreamHandler()
             console_handler.setLevel(logging.INFO)
             console_handler.setFormatter(color_fmt)
+            console_handler.addFilter(src_filter)
 
             self.logger.addHandler(file_handler)
             self.logger.addHandler(console_handler)
@@ -140,5 +164,9 @@ class Logger:
 
     def exception(self, message):
         self.logger.exception(message)
+
+    def prefixed(self, prefix: str) -> _PrefixedLogger:
+        return _PrefixedLogger(self.logger, prefix)
+
 
 logger = Logger()

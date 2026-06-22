@@ -20,7 +20,8 @@ from enum import Enum
 
 import socketio
 
-from logger import logger
+from logger import logger as _logger
+logger = _logger.prefixed("bidder")
 from db import DB
 from csgoempire_client import CSGOEmpireClient, CSGOEmpireError
 
