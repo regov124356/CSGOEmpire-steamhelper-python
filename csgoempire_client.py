@@ -5,26 +5,61 @@ Implements the public API documented at
 https://docs.csgoempire.com/reference/getting-started-with-your-api
 
 Auth:        Authorization: Bearer <api_key>
-Rate limit:  Global 120 requests / 60 seconds. Exceeding it returns HTTP 429
-             and blocks every endpoint for 60 seconds. Individual endpoints
-             carry their own (undocumented) limits, surfaced through the
-             X-RateLimit-* / Retry-After response headers.
+Rate limit:  Global request limit per key; exceeding any limit returns HTTP 429
+             and blocks every endpoint for 60 seconds. The two official sources
+             disagree on the global window: the reference page says 120 / 60s,
+             the API-Docs README says 120 / 10s. We use the safer 120 / 60s — if
+             the real window is shorter we are merely more conservative; the
+             reverse would 429. Several endpoints carry tighter documented limits
+             (e.g. Place Bid 20/10s, Get Active Trades 3/10s) — see ENDPOINT_LIMITS.
 
-The client enforces the global limit proactively with a token bucket, adapts
-to the per-endpoint limits via the rate-limit response headers, and retries
-on 429 honouring Retry-After.
+The client enforces the global limit and the per-endpoint limits proactively
+with token buckets (so it self-throttles before Empire 429s), prioritises money
+actions over bids over polling, and retries on 429 honouring Retry-After.
 """
 
 import asyncio
+import heapq
 import math
+import re
 import time
-from collections import deque
+from collections import Counter, deque
 from enum import IntEnum
 from typing import Any, Optional
 
 import aiohttp
 
+from logger import logger
+
 DEFAULT_HOST = "csgoempire.io"
+
+# Rate-limit priority tiers (lower = served first when the window is saturated).
+# HIGH: TradeBot money actions (accept/dispute/withdraw real items) — must never
+# wait behind a bid burst. BID: time-sensitive auction bids — outrank polling.
+# NORMAL: background polling / metadata — yields to both.
+PRIORITY_HIGH = 0
+PRIORITY_BID = 1
+PRIORITY_NORMAL = 2
+
+# Per-endpoint limits Empire enforces on top of the global limit (any 429 blocks
+# ALL endpoints for 60s, so we throttle preventively to avoid them).
+# Keys are normalised "METHOD /path" with numeric ids collapsed to <id>.
+# Values are (max_requests, window_seconds) set just under Empire's documented
+# caps for headroom. Docs: github.com/OfficialCSGOEmpire/API-Docs.
+ENDPOINT_LIMITS: dict[str, tuple[int, float]] = {
+    "POST /trading/deposit/<id>/bid": (18, 10.0),  # doc 20/10 (success+fail)
+    "GET /trading/user/trades":       (2, 10.0),   # doc 3/10
+}
+# Only endpoints we actually call AND that Empire caps below the global limit get
+# a bucket. Omitted because currently unused (add back if wired up, using their
+# documented caps): create_deposit (POST /trading/deposit, 20/10),
+# create_withdrawal (POST /trading/deposit/<id>/withdraw, 8/10 success, 2/10
+# failure). Everything else we call (auctions, metadata, automation status/token,
+# mark-received, dispute) is documented as global-only, so the global limiter
+# covers it.
+
+# Endpoints not listed fall back to the global limiter only (e.g. get_metadata,
+# get_active_auctions, mark_as_received, dispute_trade — documented as global).
 
 
 class TradeStatus(IntEnum):
@@ -59,42 +94,77 @@ class CSGOEmpireError(Exception):
 
 class _RateLimiter:
     """
-    Async token bucket over a rolling time window.
+    Async token bucket over a rolling time window, with priority.
 
     Keeps at most ``max_requests`` acquisitions inside any ``window`` seconds.
-    Acquisition is serialised so concurrent callers queue in FIFO order.
+    Acquirers pass a priority (lower = served first); when the window is
+    saturated the lowest-priority-number waiter takes the next free slot, so a
+    money action outranks a bid and a bid outranks background polling. A single
+    dispatcher task hands out the slots, so slot ordering is well defined and
+    there is no race on the timestamp window even when many coroutines (TradeBot
+    + BiddingBot) share one limiter.
     """
 
     def __init__(self, max_requests: int, window: float):
         self.max_requests = max_requests
         self.window = window
         self._timestamps: deque[float] = deque()
-        self._lock = asyncio.Lock()
         # Hard pause until this monotonic time, set when the API reports it is
         # out of quota (X-RateLimit-Remaining: 0 or a 429 Retry-After).
         self._blocked_until = 0.0
+        # Min-heap of (priority, seq, future); lower priority served first.
+        # seq breaks ties FIFO within a priority class.
+        self._waiters: list[tuple[int, int, asyncio.Future]] = []
+        self._seq = 0
+        self._dispatcher: Optional[asyncio.Task] = None
 
-    async def acquire(self) -> None:
-        async with self._lock:
-            while True:
-                now = time.monotonic()
+    def _drain_expired(self, now: float) -> None:
+        while self._timestamps and now - self._timestamps[0] >= self.window:
+            self._timestamps.popleft()
 
-                if now < self._blocked_until:
-                    await asyncio.sleep(self._blocked_until - now)
+    def _delay_until_slot(self, now: float) -> float:
+        """Seconds until a slot is free, or 0.0 if one is free right now."""
+        if now < self._blocked_until:
+            return self._blocked_until - now
+        self._drain_expired(now)
+        if len(self._timestamps) < self.max_requests:
+            return 0.0
+        return self.window - (now - self._timestamps[0])
+
+    async def acquire(self, priority: int = PRIORITY_NORMAL) -> None:
+        fut = asyncio.get_running_loop().create_future()
+        heapq.heappush(self._waiters, (priority, self._seq, fut))
+        self._seq += 1
+        self._ensure_dispatcher()
+        await fut
+
+    def _ensure_dispatcher(self) -> None:
+        if self._dispatcher is None or self._dispatcher.done():
+            self._dispatcher = asyncio.ensure_future(self._dispatch())
+
+    async def _dispatch(self) -> None:
+        # One unexpected error must not silently kill the dispatcher and strand
+        # every queued waiter, so each iteration is guarded; the loop keeps going.
+        while self._waiters:
+            try:
+                delay = self._delay_until_slot(time.monotonic())
+                if delay > 0.0:
+                    await asyncio.sleep(delay)
                     continue
-
-                while self._timestamps and now - self._timestamps[0] >= self.window:
-                    self._timestamps.popleft()
-
-                if len(self._timestamps) < self.max_requests:
-                    self._timestamps.append(now)
-                    return
-
-                await asyncio.sleep(self.window - (now - self._timestamps[0]))
+                _, _, fut = heapq.heappop(self._waiters)
+                if fut.done():           # caller cancelled while queued
+                    continue
+                self._timestamps.append(time.monotonic())
+                fut.set_result(None)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("[ratelimit] dispatcher iteration error — continuing")
 
     def block_for(self, seconds: float) -> None:
         """Force every caller to wait at least ``seconds`` from now."""
         self._blocked_until = max(self._blocked_until, time.monotonic() + seconds)
+        self._ensure_dispatcher()
 
 
 class CSGOEmpireClient:
@@ -118,7 +188,15 @@ class CSGOEmpireClient:
         self.max_retries = max_retries
         self._timeout = aiohttp.ClientTimeout(total=timeout)
         self._limiter = _RateLimiter(max_requests, window)
+        # Tighter buckets for the endpoints Empire rate-limits below the global
+        # cap; a request acquires its endpoint bucket (if any) and the global one.
+        self._endpoint_limiters: dict[str, _RateLimiter] = {
+            key: _RateLimiter(m, w) for key, (m, w) in ENDPOINT_LIMITS.items()
+        }
         self._session: Optional[aiohttp.ClientSession] = None
+        # TEMP(429-bug): rolling log of outgoing requests to count the burst that
+        # trips a 429. Remove once the rate-limit cause is found.
+        self._dbg_calls: deque[tuple[float, str]] = deque()
 
     # ------------------------------------------------------------------ #
     # session lifecycle
@@ -198,23 +276,61 @@ class CSGOEmpireClient:
                 cleaned[key] = value
         return cleaned or None
 
+    @staticmethod
+    def _endpoint_key(method: str, path: str) -> str:
+        """Normalise to "METHOD /path" with numeric ids collapsed to <id>, so
+        /deposit/123/bid and /deposit/456/bid map to the same ENDPOINT_LIMITS key."""
+        return f"{method} {re.sub(r'/\d+', '/<id>', path)}"
+
+    # TEMP(429-bug): request-rate instrumentation. Remove with self._dbg_calls,
+    # the _dbg_record() call in _request, and the _dbg_report_429() call in the
+    # 429 branch once the burst that trips the rate limit is identified.
+    def _dbg_endpoint(self, method: str, path: str) -> str:
+        return self._endpoint_key(method, path)
+
+    def _dbg_record(self, method: str, path: str) -> None:
+        now = time.monotonic()
+        self._dbg_calls.append((now, self._dbg_endpoint(method, path)))
+        cutoff = now - self._limiter.window
+        while self._dbg_calls and self._dbg_calls[0][0] < cutoff:
+            self._dbg_calls.popleft()
+
+    def _dbg_report_429(self, method: str, path: str) -> None:
+        now = time.monotonic()
+        cutoff = now - self._limiter.window
+        recent = [ep for ts, ep in self._dbg_calls if ts >= cutoff]
+        by_ep = Counter(recent).most_common()
+        breakdown = ", ".join(f"{ep}={n}" for ep, n in by_ep)
+        logger.warning(
+            f"[ratelimit-debug] 429 on {method} {path} — "
+            f"{len(recent)} requests this process in trailing "
+            f"{self._limiter.window:.0f}s | {breakdown}")
+
     async def _request(self, method: str, path: str, *,
                        params: Optional[dict] = None,
                        json: Optional[Any] = None,
-                       fail_fast_429: bool = False) -> Any:
+                       fail_fast_429: bool = False,
+                       priority: int = PRIORITY_NORMAL) -> Any:
         url = f"{self.base_url}{path}"
         params = self._clean_params(params)
         session = self._ensure_session()
+        endpoint_limiter = self._endpoint_limiters.get(self._endpoint_key(method, path))
         attempt = 0
 
         while True:
-            await self._limiter.acquire()
+            # Acquire the tighter endpoint bucket first, then the global one, so a
+            # request only takes a global slot once its endpoint slot is free.
+            if endpoint_limiter is not None:
+                await endpoint_limiter.acquire(priority)
+            await self._limiter.acquire(priority)
+            self._dbg_record(method, path)  # TEMP(429-bug)
             try:
                 async with session.request(method, url, params=params,
                                            json=json) as resp:
                     self._note_rate_headers(resp.headers)
 
                     if resp.status == 429:
+                        self._dbg_report_429(method, path)  # TEMP(429-bug)
                         wait = self._retry_after(resp.headers, 60.0)
                         self._limiter.block_for(wait)
                         # Time-sensitive callers (bids) raise immediately rather
@@ -369,18 +485,20 @@ class CSGOEmpireClient:
     async def mark_as_received(self, tradeoffer_id: int) -> Any:
         """POST /trading/deposit/{tradeoffer_id}/received"""
         return await self._request(
-            "POST", f"/trading/deposit/{tradeoffer_id}/received")
+            "POST", f"/trading/deposit/{tradeoffer_id}/received",
+            priority=PRIORITY_HIGH)
 
     async def dispute_trade(self, tradeoffer_id: int) -> Any:
         """POST /trading/deposit/{tradeoffer_id}/dispute"""
         return await self._request(
-            "POST", f"/trading/deposit/{tradeoffer_id}/dispute")
+            "POST", f"/trading/deposit/{tradeoffer_id}/dispute",
+            priority=PRIORITY_HIGH)
 
     async def create_withdrawal(self, deposit_id: int, coin_value: int) -> Any:
         """POST /trading/deposit/{deposit_id}/withdraw — buy/withdraw an item."""
         return await self._request(
             "POST", f"/trading/deposit/{deposit_id}/withdraw",
-            json={"coin_value": coin_value})
+            json={"coin_value": coin_value}, priority=PRIORITY_HIGH)
 
     async def place_bid(self, deposit_id: int, bid_value: int, *,
                         fail_fast_429: bool = False) -> Any:
@@ -392,10 +510,14 @@ class CSGOEmpireClient:
 
         fail_fast_429: raise immediately on 429 instead of waiting out the rate
         limit — auctions are time-sensitive, so a 60s wait wins nothing.
+
+        Bids run at PRIORITY_BID: they jump ahead of background polling but yield
+        to TradeBot's money actions when the shared rate-limit window is saturated.
         """
         return await self._request(
             "POST", f"/trading/deposit/{deposit_id}/bid",
-            json={"bid_value": bid_value}, fail_fast_429=fail_fast_429)
+            json={"bid_value": bid_value}, fail_fast_429=fail_fast_429,
+            priority=PRIORITY_BID)
 
     async def get_depositor_stats(self, deposit_id: int) -> Any:
         """GET /trading/deposit/{deposit_id}/stats"""

@@ -6,7 +6,8 @@ or below our own valuation (price_empire in the DB, produced by PriceService fro
 CSFloat resale value). Winning below our valuation is the margin.
 
 This is the buying counterpart to TradeBot (which accepts the resulting trades).
-It runs as its own process via run_bidder.py.
+It runs in the same process as TradeBot (enabled with `main.py --bidder`) so both
+share one CSGOEmpireClient, and therefore one rate-limit window.
 
 REST (place bid / list auctions / metadata) goes through CSGOEmpireClient; only
 the websocket transport and the bidding strategy live here.
@@ -70,6 +71,7 @@ class BiddingBot:
         self._meta: dict | None = None
         self._balance: int = 0          # cached, coins*100
         self._last_refresh: float = 0.0  # monotonic time of last metadata fetch
+        self._stopping = False          # set by stop() for graceful shutdown
         self._register_handlers()
 
     @property
@@ -80,15 +82,30 @@ class BiddingBot:
     # lifecycle
     # ------------------------------------------------------------------ #
     async def run(self) -> None:
-        while True:
+        while not self._stopping:
             try:
                 await self._connect_and_wait()
             except Exception as e:
+                if self._stopping:
+                    break
                 logger.error(f"[ws] init failed: {e}")
                 await asyncio.sleep(INIT_RETRY_DELAY)
                 continue
+            if self._stopping:
+                break
             logger.info(f"[ws] disconnected — reconnecting in {RECONNECT_DELAY}s")
             await asyncio.sleep(RECONNECT_DELAY)
+        logger.info("[ws] bidder stopped")
+
+    async def stop(self) -> None:
+        """Graceful shutdown: stop reconnecting and drop the websocket. The
+        process keeps running (TradeBot drains pending trades) until the caller
+        decides to exit."""
+        self._stopping = True
+        try:
+            await self._sio.disconnect()
+        except Exception as e:
+            logger.error(f"[ws] disconnect on stop failed: {e}")
 
     async def _connect_and_wait(self) -> None:
         # Fresh metadata each connection -> fresh socket token/signature/balance.
